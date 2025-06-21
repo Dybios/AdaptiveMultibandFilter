@@ -207,7 +207,7 @@ def calibrate_f0_range(duration_seconds=5):
 
         # Add a small buffer to the range to account for natural voice variation
         # and ensure it doesn't go outside the overall FMIN/FMAX
-        buffer_percent = 0.2 # 20% buffer
+        buffer_percent = 0.1 # 10% buffer
         CALIBRATED_MIN_F0 = max(FMIN_HZ, CALIBRATED_MIN_F0 * (1 - buffer_percent))
         CALIBRATED_MAX_F0 = min(FMAX_HZ, CALIBRATED_MAX_F0 * (1 + buffer_percent))
 
