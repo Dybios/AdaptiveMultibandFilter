@@ -6,13 +6,16 @@ Python Dependencies:
 - `numpy` - For numerical operations
 - `scipy` - For biquad filter design and application
 - `librosa` - Fundamental frequency estimation (using `pyin`).
+- `matplotlib` - For plotting the realtime values of gain and F0
+- `soundfile` - For writing audio output to a WAV file
 
-**Demo plotter screenshots with Q-Factor = 1.2**
+**Demo Screengrab**
 
-Low-Pitched Voice (F0 ~ 150Hz)
+_Initialization and Caliberation Phase:_
 
-![Multiband Low Pitch](https://github.com/Dybios/AdaptiveMultibandFilter/blob/main/docs/multiband_output_low_pitch.png?raw=true)
+![Caliberation & Init](https://github.com/Dybios/AdaptiveMultibandFilter/blob/main/docs/caliberation_and_init.gif?raw=true)
 
-High-Pitched Voice (F0 ~ 400Hz)
 
-![Multiband High Pitch](https://github.com/Dybios/AdaptiveMultibandFilter/blob/main/docs/multiband_output_high_pitch.png?raw=true)
+_After Caliberation:_
+
+![After caliberation](https://github.com/Dybios/AdaptiveMultibandFilter/blob/main/docs/multiband_output.png?raw=true)
