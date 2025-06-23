@@ -8,6 +8,7 @@ import collections
 import threading
 import time
 import sys
+import soundfile as sf
 
 # --- Audio Stream Parameters ---
 FORMAT = pyaudio.paInt16
@@ -17,10 +18,12 @@ CHUNK = 4098 # Samples per audio buffer (callback)
 
 # --- Filter Parameters ---
 TARGET_Q_FACTOR_F0 = 0.707 # Q factor for the F0-tracking filter
+MAKEUP_GAIN = 3.0   # Overall gain applied after summing all filtered bands
+GAIN_SMOOTHING_ALPHA = 0.15 # Gain Smoothing: Adjust this value (e.g., 0.05 for more smooth, 0.2 for less)
+
 DEFAULT_F0_HZ = 150 # Default F0 when no voice is detected, for filter initialization/plotting
 MIN_VALID_F0 = 60   # Minimum F0 to consider valid for general tracking
 MAX_VALID_F0 = 500  # Maximum F0 to consider valid for general tracking
-MAKEUP_GAIN = 2.0   # Overall gain applied after summing all filtered bands
 
 # --- Pitch Estimation Parameters ---
 FMIN_HZ = 50 # Lower bound for librosa.pyin search
@@ -59,6 +62,7 @@ current_gains = {
     'G_f3': 1.0, # Corresponds to FORMANT_FIXED_2
 }
 
+output_audio_buffer = [] # List to accumulate processed float audio chunks
 
 # --- Filter Design Function ---
 # This function now takes q_factor for consistency with F0 filter logic,
@@ -207,7 +211,7 @@ def calibrate_f0_range(duration_seconds=5):
 
         # Add a small buffer to the range to account for natural voice variation
         # and ensure it doesn't go outside the overall FMIN/FMAX
-        buffer_percent = 0.1 # 10% buffer
+        buffer_percent = 0.37 # 37% buffer
         CALIBRATED_MIN_F0 = max(FMIN_HZ, CALIBRATED_MIN_F0 * (1 - buffer_percent))
         CALIBRATED_MAX_F0 = min(FMAX_HZ, CALIBRATED_MAX_F0 * (1 + buffer_percent))
 
@@ -220,6 +224,30 @@ def calibrate_f0_range(duration_seconds=5):
     p_cal.terminate()
     print(f"--- Calibration Complete ---")
 
+# --- Gain Smoothing Function ---
+def apply_gain_smoothing(target_gains_dict, current_smoothed_gains_dict, alpha):
+    """
+    Applies a first-order low-pass filter (exponential moving average) to each gain.
+
+    Args:
+        target_gains_dict (dict): The instantaneously desired gain values.
+        current_smoothed_gains_dict (dict): The dictionary containing the smoothed gain values
+                                            from the previous iteration. This dictionary will be
+                                            updated in-place with the new smoothed values.
+        alpha (float): The smoothing factor (0.0 to 1.0). Smaller alpha means more smoothing.
+    """
+    for key, target_value in target_gains_dict.items():
+        # Ensure the key exists in the smoothed dictionary, initialize if it somehow doesn't
+        if key not in current_smoothed_gains_dict:
+            current_smoothed_gains_dict[key] = target_value # Initialize if missing
+
+        # Apply the LPF formula
+        current_smoothed_gains_dict[key] = (
+            alpha * target_value +
+            (1 - alpha) * current_smoothed_gains_dict[key]
+        )
+        # Clip the smoothed gain to stay within valid range [0.0, 1.0]
+        current_smoothed_gains_dict[key] = np.clip(current_smoothed_gains_dict[key], 0.0, 1.0)
 
 # --- Audio Processing Function ---
 def audio_callback(in_data, frame_count, time_info, status):
@@ -274,24 +302,23 @@ def audio_callback(in_data, frame_count, time_info, status):
     # This helps stabilize the F0 filter frequency
     smoothed_f0 = np.median([f for f in f0_history if f > 0]) if any(f > 0 for f in f0_history) else 0.0
 
+    target_gains = {}
     # Update the current gains based on whether speech signal is found.
     if voiced_flag_for_block and current_f0 > 0:
         # If voiced speech is detected within calibrated range, prioritize passing
-        current_gains['G_f0'] = 1.0 # High gain for F0 band
-        current_gains['G_f1'] = 1.0 # High gain for Formant 1 band
-        current_gains['G_f2'] = 1.0 # High gain for Formant 2 band
-        current_gains['G_f3'] = 1.0 # High gain for Formant 3 band
+        target_gains['G_f0'] = 1.0 # High gain for F0 band
+        target_gains['G_f1'] = 1.0 # High gain for Formant 1 band
+        target_gains['G_f2'] = 1.0 # High gain for Formant 2 band
+        target_gains['G_f3'] = 1.0 # High gain for Formant 3 band
     else:
         # No valid voice detected for this block (or F0 outside calibrated range)
         # Apply more aggressive attenuation to all speech-related bands
-        current_gains['G_f0'] = 0.05 # Strong attenuation for F0 band
-        current_gains['G_f1'] = 0.05
-        current_gains['G_f2'] = 0.05
-        current_gains['G_f3'] = 0.05
+        target_gains['G_f0'] = 0.05 # Strong attenuation for F0 band
+        target_gains['G_f1'] = 0.05
+        target_gains['G_f2'] = 0.05
+        target_gains['G_f3'] = 0.05
 
-    # Ensure gains are always within 0.0 and 1.0
-    for key in current_gains:
-        current_gains[key] = np.clip(current_gains[key], 0.0, 1.0)
+    apply_gain_smoothing(target_gains, current_gains, GAIN_SMOOTHING_ALPHA)
 
     # --- Apply all filters in parallel and sum outputs with individual gains ---
     summed_filtered_audio = np.zeros_like(audio_chunk_float)
@@ -325,9 +352,9 @@ def audio_callback(in_data, frame_count, time_info, status):
 
     # Apply makeup gain and convert back to int16
     summed_filtered_audio = np.clip(summed_filtered_audio * MAKEUP_GAIN, -1.0, 1.0)
-    audio_chunk_int16_filtered = np.int16(summed_filtered_audio * 32767.0)
+    output_audio_buffer.append(summed_filtered_audio) # Append float data
 
-    return audio_chunk_int16_filtered.tobytes(), pyaudio.paContinue
+    return None, pyaudio.paContinue
 
 
 # --- Animation Update Function ---
@@ -378,6 +405,8 @@ def update_plot(frame):
 # --- PyAudio Setup ---
 p = pyaudio.PyAudio()
 
+output_filename = "filtered_microphone_output.wav"
+
 # Initialize filters once at startup
 initialize_filters()
 
@@ -385,7 +414,7 @@ initialize_filters()
 calibrate_f0_range(duration_seconds=5)
 
 print("\nStarting real-time audio filter. Speak into your microphone.")
-print("The system will try to filter based on your calibrated F0 range and simulated ML gains.")
+print("The system will try to filter based on your calibrated F0 range.")
 print("Press Ctrl+C to stop.")
 
 # --- Matplotlib Plot Setup ---
@@ -437,7 +466,6 @@ try:
                     channels=CHANNELS,
                     rate=RATE,
                     input=True,
-                    output=True,
                     frames_per_buffer=CHUNK,
                     stream_callback=audio_callback)
 
@@ -458,5 +486,17 @@ finally:
     if 'stream' in locals():
         stream.close()
     p.terminate()
+    
+    print("DEBUG: Processing recorded audio for file output...")
+    if output_audio_buffer:
+        final_output_array = np.concatenate(output_audio_buffer)
+        try:
+            sf.write(output_filename, final_output_array, RATE)
+            print(f"Successfully wrote filtered audio to '{output_filename}'")
+        except Exception as e:
+            print(f"Error writing WAV file: {e}", file=sys.stderr)
+    else:
+        print("No audio data was recorded to write to file.")
+    
     plt.close(fig) # Close the matplotlib figure
     print("Audio streams and monitor closed.")
