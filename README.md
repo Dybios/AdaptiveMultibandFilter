@@ -1,5 +1,5 @@
 # AdaptiveMultibandFilter
-This is a basic Python script to create a simple 3-band (fundamental, 1st and 2nd order formants of vocal range) adaptive bandpass filter by automatically detecting the fundamental frequency (F0) of the voice and adjusting the filter parameters with it.
+This is a basic Python script to create a simple 4-band (fundamental, 1st, 2nd and 3rd order formants of vocal range) adaptive bandpass filter by automatically detecting the fundamental frequency (F0) of the voice and adjusting the filter parameters with it.
 
 Python Dependencies: 
 - `pyaudio` - For real-time audio input/output
@@ -8,6 +8,7 @@ Python Dependencies:
 - `librosa` - Fundamental frequency estimation (using `pyin`).
 - `matplotlib` - For plotting the realtime values of gain and F0
 - `soundfile` - For writing audio output to a WAV file
+- `json` - Saved caliberation data configuration file
 
 **Demo Screengrab**
 
