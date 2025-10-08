@@ -9,6 +9,8 @@ import threading
 import time
 import sys
 import soundfile as sf
+import json
+import os
 
 # --- Audio Stream Parameters ---
 FORMAT = pyaudio.paInt16
@@ -20,10 +22,12 @@ CHUNK = 4098 # Samples per audio buffer (callback)
 TARGET_Q_FACTOR_F0 = 0.707 # Q factor for the F0-tracking filter
 MAKEUP_GAIN = 3.0   # Overall gain applied after summing all filtered bands
 GAIN_SMOOTHING_ALPHA = 0.15 # Gain Smoothing: Adjust this value (e.g., 0.05 for more smooth, 0.2 for less)
+F0_SMOOTHING_ALPHA = 0.15
 
 DEFAULT_F0_HZ = 150 # Default F0 when no voice is detected, for filter initialization/plotting
 MIN_VALID_F0 = 60   # Minimum F0 to consider valid for general tracking
 MAX_VALID_F0 = 500  # Maximum F0 to consider valid for general tracking
+F0_CURRENT_SMOOTHED = DEFAULT_F0_HZ 
 
 # --- Pitch Estimation Parameters ---
 FMIN_HZ = 50 # Lower bound for librosa.pyin search
@@ -216,6 +220,17 @@ def calibrate_f0_range(duration_seconds=5):
         CALIBRATED_MAX_F0 = min(FMAX_HZ, CALIBRATED_MAX_F0 * (1 + buffer_percent))
 
         print(f"Calibrated F0 range: {CALIBRATED_MIN_F0:.2f} Hz to {CALIBRATED_MAX_F0:.2f} Hz")
+
+        calibration_data = {
+            "min_f0": CALIBRATED_MIN_F0,
+            "max_f0": CALIBRATED_MAX_F0
+        }
+        try:
+            with open("f0_calibration_data.json", "w") as f:
+                json.dump(calibration_data, f, indent=4)
+            print("Calibration data saved to f0_calibration_data.json")
+        except Exception as e:
+            print(f"WARNING: Could not save calibration data: {e}", file=sys.stderr)
     else:
         print("Could not detect sufficient F0 during calibration. Using default F0 range.")
         CALIBRATED_MIN_F0 = None # Reset to use defaults
@@ -251,10 +266,11 @@ def apply_gain_smoothing(target_gains_dict, current_smoothed_gains_dict, alpha):
 
 # --- Audio Processing Function ---
 def audio_callback(in_data, frame_count, time_info, status):
-    if status:
-        print(status, file=sys.stderr)
+    #if status:
+        #print(status, file=sys.stderr)
 
     global f0_history, current_gains, active_filters
+    global F0_CURRENT_SMOOTHED
 
     audio_chunk_int16 = np.frombuffer(in_data, dtype=np.int16)
     audio_chunk_float = audio_chunk_int16.astype(np.float32) / 32768.0 # Normalize to -1.0 to 1.0
@@ -322,27 +338,24 @@ def audio_callback(in_data, frame_count, time_info, status):
 
     # --- Apply all filters in parallel and sum outputs with individual gains ---
     summed_filtered_audio = np.zeros_like(audio_chunk_float)
-
+    
+    # Determine the F0 used for filter design (Smoothed F0)
+    target_f0 = smoothed_f0 if smoothed_f0 > 0 else DEFAULT_F0_HZ
+    current_f0 = F0_CURRENT_SMOOTHED
+    
+    F0_CURRENT_SMOOTHED = (F0_SMOOTHING_ALPHA * target_f0) + ((1 - F0_SMOOTHING_ALPHA) * current_f0)
+    F0_CURRENT_SMOOTHED = np.clip(F0_CURRENT_SMOOTHED, MIN_VALID_F0, MAX_VALID_F0)
+    
     with filter_lock: # Ensure coefficients and states don't change during filtering
         for f_data in active_filters:
             # 1. Update filter coefficients for F0-tracking filter
             if f_data['type'] == 'F0_TRACKING':
-                if smoothed_f0 > 0: # Only update if a valid (smoothed) F0 is present
-                    current_f0_bandwidth_hz = smoothed_f0 / TARGET_Q_FACTOR_F0
-                    f_data['b'], f_data['a'] = design_bandpass_biquad(
-                        smoothed_f0, current_f0_bandwidth_hz, RATE, use_q_factor=False # Use bandwidth calc
-                    )
-                    # Reset zi if coefficients change. This can cause tiny clicks, but ensures stability.
-                    # For perfectly smooth transitions, more advanced state management is needed.
-                    f_data['zi'] = np.zeros(max(len(f_data['b']), len(f_data['a'])) - 1)
-                else:
-                    # If no valid F0, flatten the F0 filter response (passthrough for coefficients)
-                    # The gain will then effectively mute it.
-                    f_data['b'] = np.array([1.0, 0.0, 0.0])
-                    f_data['a'] = np.array([1.0, 0.0, 0.0])
-                    f_data['zi'] = np.zeros(max(len(f_data['b']), len(f_data['a'])) - 1)
-
-
+                current_f0_bandwidth_hz = F0_CURRENT_SMOOTHED / TARGET_Q_FACTOR_F0
+                # Design the new stable coefficients
+                f_data['b'], f_data['a'] = design_bandpass_biquad(
+                    F0_CURRENT_SMOOTHED, current_f0_bandwidth_hz, RATE, use_q_factor=False
+                )
+            
             # 2. Apply filter to the input data
             filtered_band, f_data['zi'] = lfilter(f_data['b'], f_data['a'], audio_chunk_float, zi=f_data['zi'])
 
@@ -400,8 +413,6 @@ def update_plot(frame):
     # Return all updated lines for blitting
     return tuple(filter_lines) + (line_f0,)
 
-# --- Main execution block ---
-#if __name__ == '__main_':
 # --- PyAudio Setup ---
 p = pyaudio.PyAudio()
 
@@ -410,8 +421,30 @@ output_filename = "filtered_microphone_output.wav"
 # Initialize filters once at startup
 initialize_filters()
 
-# Perform F0 calibration for the user's voice
-calibrate_f0_range(duration_seconds=5)
+# Check for caliberation file to get the f0 data.
+CALIBRATION_FILE = "f0_calibration_data.json"
+if os.path.exists(CALIBRATION_FILE):
+    print(f"Found existing calibration file: '{CALIBRATION_FILE}'. Loading data.")
+    try:
+        with open(CALIBRATION_FILE, "r") as f:
+            cal_data = json.load(f)
+            
+        CALIBRATED_MIN_F0 = cal_data.get("min_f0")
+        CALIBRATED_MAX_F0 = cal_data.get("max_f0")
+        
+        if CALIBRATED_MIN_F0 is None or CALIBRATED_MAX_F0 is None:
+            raise ValueError("Calibration file is corrupted or missing keys.")
+            
+        print(f"Loaded F0 range: {CALIBRATED_MIN_F0:.2f} Hz to {CALIBRATED_MAX_F0:.2f} Hz.")
+        
+    except Exception as e:
+        print(f"Error loading calibration data ({e}). Running new calibration.")
+        # If loading fails, fall through and run a new calibration
+        calibrate_f0_range(duration_seconds=5) 
+else:
+    # Perform F0 calibration for the user's voice
+    print(f"Calibration file '{CALIBRATION_FILE}' not found. Running new calibration.")
+    calibrate_f0_range(duration_seconds=5)
 
 print("\nStarting real-time audio filter. Speak into your microphone.")
 print("The system will try to filter based on your calibrated F0 range.")
